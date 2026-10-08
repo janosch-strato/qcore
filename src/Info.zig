@@ -90,6 +90,9 @@ const JobArgs = struct {
     ignore_errors: bool,
     errors: usize,
     netns_warned: bool = false,
+    // qcore's own netns to return to after a netlink dump, or null when the
+    // target shares it and no setns is needed
+    self_netns: ?std.Io.File = null,
 };
 
 // Phase 2 collect
@@ -116,6 +119,17 @@ pub fn collect(gpa: std.mem.Allocator, pid: i32, pids: process.PidsMap, nproc: u
         .ignore_errors = false,
         .errors = 0,
     };
+
+    // Check whether the target's netns differs from ours before any job is
+    // queued: jobs may also run on this thread and switch its netns.
+    if (!try proc.isSameNamespace(io, pid, "net")) {
+        job_args.self_netns = std.Io.Dir.openFileAbsolute(io, "/proc/self/ns/net",
+            .{}) catch |err| {
+            log.E("Failed to open /proc/self/ns/net: {}", .{err});
+            return err;
+        };
+    }
+    defer if (job_args.self_netns) |self_netns| self_netns.close(io);
 
     const netlink_params = [5]struct {u8, u8, bool, []const u8 } {
         .{ diag.AF_INET,  diag.IPPROTO_TCP, false, "/netlink_tcp.raw" },
@@ -281,8 +295,10 @@ fn jobWorker(args: *JobArgs, job: Job) void {
     const ret = switch (job.collect_type) {
         .File => collectFile(gpa, io, job.path),
         .Symlink => collectSymlink(gpa, io, job.path),
-        .NetlinkIp => collectNetlinkRetry(gpa, io, pid, job.af, job.proto, false, job.path),
-        .NetlinkUnix => collectNetlinkRetry(gpa, io, pid, job.af, job.proto, true, job.path),
+        .NetlinkIp => collectNetlinkRetry(gpa, io, pid, args.self_netns, job.af, job.proto,
+            false, job.path),
+        .NetlinkUnix => collectNetlinkRetry(gpa, io, pid, args.self_netns, job.af, job.proto,
+            true, job.path),
     };
     args.info_mutex.lock(io) catch
         @panic("Failed to lock info mutex");
@@ -343,11 +359,11 @@ fn collectSymlink(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !File
     };
 }
 
-fn collectNetlinkRetry(gpa: std.mem.Allocator, io: std.Io, pid: i32, af: u8, proto: u8,
-    is_unix: bool, path: []const u8) !File
+fn collectNetlinkRetry(gpa: std.mem.Allocator, io: std.Io, pid: i32, self_netns: ?std.Io.File,
+    af: u8, proto: u8, is_unix: bool, path: []const u8) !File
 {
     for (1..4) |attempt| {
-        const ret = collectNetlink(gpa, io, pid, af, proto, is_unix, path);
+        const ret = collectNetlink(gpa, io, pid, self_netns, af, proto, is_unix, path);
         if (!std.meta.isError(ret)) {
             return ret;
         }
@@ -360,24 +376,9 @@ fn collectNetlinkRetry(gpa: std.mem.Allocator, io: std.Io, pid: i32, af: u8, pro
     return error.NetlinkDumpInterrupted;
 }
 
-fn collectNetlink(gpa: std.mem.Allocator, io: std.Io, pid: i32, af: u8, proto: u8,
-    is_unix: bool, path: []const u8) !File
+fn collectNetlink(gpa: std.mem.Allocator, io: std.Io, pid: i32, self_netns: ?std.Io.File,
+    af: u8, proto: u8, is_unix: bool, path: []const u8) !File
 {
-    // enter namespace
-    const self_ns = std.Io.Dir.openFileAbsolute(io, "/proc/self/ns/net", .{}) catch |err| {
-        log.E("Failed to open /proc/self/ns/net: {}", .{err});
-        return err;
-    };
-    defer self_ns.close(io);
-
-    // restore qcore's own network namespace on the way out, but only if we
-    // actually switched into the target's below
-    var entered = false;
-    defer {
-        if (entered)
-            _ = std.os.linux.setns(self_ns.handle, std.os.linux.CLONE.NEWNET);
-    }
-
     const ns_path = try std.fmt.allocPrint(gpa, "/proc/{d}/ns/net", .{ pid });
     const target_ns = std.Io.Dir.openFileAbsolute(io, ns_path, .{}) catch |err| {
         log.E("Failed to open target netns {s}: {}", .{ns_path, err});
@@ -389,7 +390,7 @@ fn collectNetlink(gpa: std.mem.Allocator, io: std.Io, pid: i32, af: u8, proto: u
     // qcore already shares that netns - the common case for an unprivileged
     // same-host dump - the setns would be a no-op that still requires the
     // capability, so skip it and dump the sockets directly.
-    if (!try proc.isSameNamespace(io, pid, "net")) {
+    if (self_netns != null) {
         // setns is a raw syscall wrapper returning a usize, so a failure is
         // encoded as -errno in the return value rather than in C errno.
         const ret: isize = @bitCast(std.os.linux.setns(target_ns.handle,
@@ -409,7 +410,11 @@ fn collectNetlink(gpa: std.mem.Allocator, io: std.Io, pid: i32, af: u8, proto: u
             log.E("Failed to setns to target netns: errno {d}", .{err_no});
             return error.SetNsFailedErro;
         }
-        entered = true;
+    }
+    // switch back to qcore's own network namespace when collectNetlink returns
+    defer {
+        if (self_netns) |self|
+            _ = std.os.linux.setns(self.handle, std.os.linux.CLONE.NEWNET);
     }
 
     const fd = std.c.socket(diag.AF_NETLINK, diag.SOCK_RAW | diag.SOCK_CLOEXEC,
